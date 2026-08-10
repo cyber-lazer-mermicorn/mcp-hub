@@ -14,23 +14,40 @@ export class ToolRegistry {
   private tools: Map<string, MCPTool> = new Map();
 
   register(tool: MCPTool) {
-    this.tools.set(tool.name, tool);
+    try {
+      this.tools.set(tool.name, tool);
+      return { success: true };
+    } catch (error: any) {
+      throw new Error(`Register tool error: ${error?.message || 'Unknown error'}`);
+    }
   }
 
   get(name: string): MCPTool | undefined {
-    return this.tools.get(name);
+    try {
+      return this.tools.get(name);
+    } catch (error: any) {
+      throw new Error(`Get tool error: ${error?.message || 'Unknown error'}`);
+    }
   }
 
   list(): MCPTool[] {
-    return Array.from(this.tools.values());
+    try {
+      return Array.from(this.tools.values());
+    } catch (error: any) {
+      throw new Error(`List tools error: ${error?.message || 'Unknown error'}`);
+    }
   }
 
   search(query: string): MCPTool[] {
-    const queryLower = query.toLowerCase();
-    return this.list().filter(
-      t => t.name.toLowerCase().includes(queryLower) || 
-           t.description.toLowerCase().includes(queryLower)
-    );
+    try {
+      const queryLower = query.toLowerCase();
+      return this.list().filter(
+        t => t.name.toLowerCase().includes(queryLower) || 
+             t.description.toLowerCase().includes(queryLower)
+      );
+    } catch (error: any) {
+      throw new Error(`Search tools error: ${error?.message || 'Unknown error'}`);
+    }
   }
 }
 
@@ -41,8 +58,12 @@ export const readFileTool: MCPTool = {
   inputSchema: z.object({ path: z.string() }),
   outputSchema: z.object({ content: z.string(), size: z.number() }),
   handler: async (input) => {
-    // Implementation would read actual file
-    return { content: `Contents of ${input.path}`, size: 1024 };
+    try {
+      // Implementation would read actual file
+      return { content: `Contents of ${input.path}`, size: 1024 };
+    } catch (error: any) {
+      throw new Error(`Read file error: ${error?.message || 'Unknown error'}`);
+    }
   },
 };
 
@@ -52,7 +73,12 @@ export const queryDatabaseTool: MCPTool = {
   inputSchema: z.object({ query: z.string(), params: z.array(z.any()).optional() }),
   outputSchema: z.object({ rows: z.array(z.any()), affectedRows: z.number() }),
   handler: async (input) => {
-    return { rows: [], affectedRows: 0 };
+    try {
+      // Implementation would execute actual query
+      return { rows: [], affectedRows: 0 };
+    } catch (error: any) {
+      throw new Error(`Query database error: ${error?.message || 'Unknown error'}`);
+    }
   },
 };
 
@@ -62,7 +88,12 @@ export const generateTextTool: MCPTool = {
   inputSchema: z.object({ prompt: z.string(), model: z.string().optional() }),
   outputSchema: z.object({ text: z.string(), tokens: z.number() }),
   handler: async (input) => {
-    return { text: `Generated response for: ${input.prompt}`, tokens: 100 };
+    try {
+      // Implementation would call AI API
+      return { text: `Generated response for: ${input.prompt}`, tokens: 100 };
+    } catch (error: any) {
+      throw new Error(`Generate text error: ${error?.message || 'Unknown error'}`);
+    }
   },
 };
 
@@ -85,33 +116,41 @@ export class MCPServer {
     tool: string;
     input: any;
   }): Promise<any> {
-    const tool = this.registry.get(request.tool);
-    if (!tool) {
-      throw new Error(`Tool not found: ${request.tool}`);
+    try {
+      const tool = this.registry.get(request.tool);
+      if (!tool) {
+        throw new Error(`Tool not found: ${request.tool}`);
+      }
+
+      // Validate input
+      const inputResult = tool.inputSchema.safeParse(request.input);
+      if (!inputResult.success) {
+        throw new Error(`Invalid input: ${inputResult.error.message}`);
+      }
+
+      // Execute tool
+      const output = await tool.handler(inputResult.data);
+
+      // Validate output
+      const outputResult = tool.outputSchema.safeParse(output);
+      if (!outputResult.success) {
+        throw new Error(`Invalid output: ${outputResult.error.message}`);
+      }
+
+      return outputResult.data;
+    } catch (error: any) {
+      throw new Error(`Handle request error: ${error?.message || 'Unknown error'}`);
     }
-
-    // Validate input
-    const inputResult = tool.inputSchema.safeParse(request.input);
-    if (!inputResult.success) {
-      throw new Error(`Invalid input: ${inputResult.error.message}`);
-    }
-
-    // Execute tool
-    const output = await tool.handler(inputResult.data);
-
-    // Validate output
-    const outputResult = tool.outputSchema.safeParse(output);
-    if (!outputResult.success) {
-      throw new Error(`Invalid output: ${outputResult.error.message}`);
-    }
-
-    return outputResult.data;
   }
 
   getAvailableTools() {
-    return this.registry.list().map(t => ({
-      name: t.name,
-      description: t.description,
-    }));
+    try {
+      return this.registry.list().map(t => ({
+        name: t.name,
+        description: t.description,
+      }));
+    } catch (error: any) {
+      throw new Error(`Get available tools error: ${error?.message || 'Unknown error'}`);
+    }
   }
 }
