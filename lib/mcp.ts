@@ -1,156 +1,286 @@
 import { z } from 'zod';
+import { readFileSync } from 'fs';
+import {
+  supabaseQueryTool,
+  supabaseInsertTool,
+  vercelListDeploymentsTool,
+  vercelGetProjectTool,
+  hfTextGenerationTool,
+  hfImageGenerationTool,
+  linearListIssuesTool,
+  linearCreateIssueTool,
+} from './connectors';
 
-// MCP Tool Definition
+// ─── Types ────────────────────────────────────────────────────────────────────
+
 export interface MCPTool {
   name: string;
   description: string;
   inputSchema: z.ZodSchema;
   outputSchema: z.ZodSchema;
-  handler: (input: any) => Promise<any>;
+  handler: (input: unknown) => Promise<unknown>;
 }
 
-// Tool Registry
-export class ToolRegistry {
-  private tools: Map<string, MCPTool> = new Map();
+export interface MCPRequest {
+  tool: string;
+  input: unknown;
+  requestId?: string;
+}
 
-  register(tool: MCPTool) {
-    try {
-      this.tools.set(tool.name, tool);
-      return { success: true };
-    } catch (error: any) {
-      throw new Error(`Register tool error: ${error?.message || 'Unknown error'}`);
+export interface MCPResponse<T = unknown> {
+  success: boolean;
+  data?: T;
+  error?: string;
+  requestId?: string;
+  durationMs: number;
+  tool: string;
+}
+
+interface CircuitState {
+  failures: number;
+  lastFailure: number;
+  open: boolean;
+}
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const CIRCUIT_FAILURE_THRESHOLD = 5;
+const CIRCUIT_RESET_MS = 60_000;
+const MAX_RETRIES = 3;
+const RETRY_BASE_DELAY_MS = 200;
+
+// ─── Tool Registry ────────────────────────────────────────────────────────────
+
+export class ToolRegistry {
+  private readonly tools = new Map<string, MCPTool>();
+
+  register(tool: MCPTool): void {
+    if (this.tools.has(tool.name)) {
+      throw new Error(`Tool '${tool.name}' is already registered — use replace() to override.`);
     }
+    this.tools.set(tool.name, tool);
   }
 
-  get(name: string): MCPTool | undefined {
-    try {
-      return this.tools.get(name);
-    } catch (error: any) {
-      throw new Error(`Get tool error: ${error?.message || 'Unknown error'}`);
-    }
+  replace(tool: MCPTool): void {
+    this.tools.set(tool.name, tool);
+  }
+
+  get(name: string): MCPTool {
+    const tool = this.tools.get(name);
+    if (!tool) throw new Error(`Tool not found: '${name}'. Available: ${this.names().join(', ')}`);
+    return tool;
+  }
+
+  has(name: string): boolean {
+    return this.tools.has(name);
   }
 
   list(): MCPTool[] {
-    try {
-      return Array.from(this.tools.values());
-    } catch (error: any) {
-      throw new Error(`List tools error: ${error?.message || 'Unknown error'}`);
-    }
+    return Array.from(this.tools.values());
+  }
+
+  names(): string[] {
+    return Array.from(this.tools.keys());
   }
 
   search(query: string): MCPTool[] {
-    try {
-      const queryLower = query.toLowerCase();
-      return this.list().filter(
-        t => t.name.toLowerCase().includes(queryLower) || 
-             t.description.toLowerCase().includes(queryLower)
-      );
-    } catch (error: any) {
-      throw new Error(`Search tools error: ${error?.message || 'Unknown error'}`);
-    }
+    const q = query.toLowerCase();
+    return this.list().filter(
+      (t) => t.name.toLowerCase().includes(q) || t.description.toLowerCase().includes(q)
+    );
+  }
+
+  size(): number {
+    return this.tools.size;
   }
 }
 
-// Pre-built Tools
-export const readFileTool: MCPTool = {
+// ─── Read File Tool (real fs implementation) ─────────────────────────────────
+
+const readFileTool: MCPTool = {
   name: 'read_file',
-  description: 'Read contents of a file',
-  inputSchema: z.object({ path: z.string() }),
-  outputSchema: z.object({ content: z.string(), size: z.number() }),
-  handler: async (input) => {
-    try {
-      // Implementation would read actual file
-      return { content: `Contents of ${input.path}`, size: 1024 };
-    } catch (error: any) {
-      throw new Error(`Read file error: ${error?.message || 'Unknown error'}`);
-    }
+  description: 'Read the UTF-8 contents of a local file by absolute or relative path.',
+  inputSchema: z.object({
+    path: z.string().min(1),
+    encoding: z.enum(['utf-8', 'base64']).optional().default('utf-8'),
+  }),
+  outputSchema: z.object({
+    content: z.string(),
+    sizeBytes: z.number(),
+    encoding: z.string(),
+  }),
+  handler: async ({ path, encoding }) => {
+    const raw = readFileSync(path as string);
+    const content =
+      encoding === 'base64' ? raw.toString('base64') : raw.toString('utf-8');
+    return { content, sizeBytes: raw.byteLength, encoding: encoding as string };
   },
 };
 
-export const queryDatabaseTool: MCPTool = {
-  name: 'query_database',
-  description: 'Execute a SQL query',
-  inputSchema: z.object({ query: z.string(), params: z.array(z.any()).optional() }),
-  outputSchema: z.object({ rows: z.array(z.any()), affectedRows: z.number() }),
-  handler: async (input) => {
-    try {
-      // Implementation would execute actual query
-      return { rows: [], affectedRows: 0 };
-    } catch (error: any) {
-      throw new Error(`Query database error: ${error?.message || 'Unknown error'}`);
-    }
-  },
-};
+// ─── MCP Server ───────────────────────────────────────────────────────────────
 
-export const generateTextTool: MCPTool = {
-  name: 'generate_text',
-  description: 'Generate text using AI',
-  inputSchema: z.object({ prompt: z.string(), model: z.string().optional() }),
-  outputSchema: z.object({ text: z.string(), tokens: z.number() }),
-  handler: async (input) => {
-    try {
-      // Implementation would call AI API
-      return { text: `Generated response for: ${input.prompt}`, tokens: 100 };
-    } catch (error: any) {
-      throw new Error(`Generate text error: ${error?.message || 'Unknown error'}`);
-    }
-  },
-};
-
-// MCP Server
 export class MCPServer {
-  private registry: ToolRegistry;
+  private readonly registry: ToolRegistry;
+  private readonly circuits = new Map<string, CircuitState>();
+  private readonly telemetry: Array<{
+    requestId: string;
+    tool: string;
+    success: boolean;
+    durationMs: number;
+    ts: number;
+  }> = [];
 
   constructor() {
     this.registry = new ToolRegistry();
-    this.registerDefaults();
+    this.bootstrap();
   }
 
-  private registerDefaults() {
-    this.registry.register(readFileTool);
-    this.registry.register(queryDatabaseTool);
-    this.registry.register(generateTextTool);
+  private bootstrap(): void {
+    const tools: MCPTool[] = [
+      readFileTool,
+      supabaseQueryTool,
+      supabaseInsertTool,
+      vercelListDeploymentsTool,
+      vercelGetProjectTool,
+      hfTextGenerationTool,
+      hfImageGenerationTool,
+      linearListIssuesTool,
+      linearCreateIssueTool,
+    ];
+    for (const tool of tools) this.registry.register(tool);
   }
 
-  async handleRequest(request: {
-    tool: string;
-    input: any;
-  }): Promise<any> {
+  // ─── Circuit Breaker ──────────────────────────────────────────────────────
+
+  private getCircuit(name: string): CircuitState {
+    if (!this.circuits.has(name)) {
+      this.circuits.set(name, { failures: 0, lastFailure: 0, open: false });
+    }
+    return this.circuits.get(name)!;
+  }
+
+  private checkCircuit(name: string): void {
+    const c = this.getCircuit(name);
+    if (!c.open) return;
+    const elapsed = Date.now() - c.lastFailure;
+    if (elapsed >= CIRCUIT_RESET_MS) {
+      c.open = false;
+      c.failures = 0;
+    } else {
+      throw new Error(
+        `Circuit open for '${name}' — cooling down (${Math.round((CIRCUIT_RESET_MS - elapsed) / 1000)}s remaining).`
+      );
+    }
+  }
+
+  private recordCircuit(name: string, failed: boolean): void {
+    const c = this.getCircuit(name);
+    if (failed) {
+      c.failures += 1;
+      c.lastFailure = Date.now();
+      if (c.failures >= CIRCUIT_FAILURE_THRESHOLD) c.open = true;
+    } else {
+      c.failures = 0;
+      c.open = false;
+    }
+  }
+
+  // ─── Retry with Exponential Backoff ──────────────────────────────────────
+
+  private async withRetry<T>(
+    fn: () => Promise<T>,
+    toolName: string,
+    attempt = 0
+  ): Promise<T> {
     try {
+      const result = await fn();
+      this.recordCircuit(toolName, false);
+      return result;
+    } catch (err: unknown) {
+      this.recordCircuit(toolName, true);
+      if (attempt >= MAX_RETRIES - 1) throw err;
+      const delay = RETRY_BASE_DELAY_MS * 2 ** attempt;
+      await new Promise((r) => setTimeout(r, delay));
+      return this.withRetry(fn, toolName, attempt + 1);
+    }
+  }
+
+  // ─── Request Handler ──────────────────────────────────────────────────────
+
+  async handle<T = unknown>(request: MCPRequest): Promise<MCPResponse<T>> {
+    const start = Date.now();
+    const requestId = request.requestId ?? crypto.randomUUID();
+
+    try {
+      this.checkCircuit(request.tool);
       const tool = this.registry.get(request.tool);
-      if (!tool) {
-        throw new Error(`Tool not found: ${request.tool}`);
+
+      const parsed = tool.inputSchema.safeParse(request.input);
+      if (!parsed.success) {
+        throw new Error(`Input validation failed: ${parsed.error.message}`);
       }
 
-      // Validate input
-      const inputResult = tool.inputSchema.safeParse(request.input);
-      if (!inputResult.success) {
-        throw new Error(`Invalid input: ${inputResult.error.message}`);
+      const raw = await this.withRetry(() => tool.handler(parsed.data), request.tool);
+
+      const validated = tool.outputSchema.safeParse(raw);
+      if (!validated.success) {
+        throw new Error(`Output validation failed: ${validated.error.message}`);
       }
 
-      // Execute tool
-      const output = await tool.handler(inputResult.data);
-
-      // Validate output
-      const outputResult = tool.outputSchema.safeParse(output);
-      if (!outputResult.success) {
-        throw new Error(`Invalid output: ${outputResult.error.message}`);
-      }
-
-      return outputResult.data;
-    } catch (error: any) {
-      throw new Error(`Handle request error: ${error?.message || 'Unknown error'}`);
+      const durationMs = Date.now() - start;
+      this.record(requestId, request.tool, true, durationMs);
+      return { success: true, data: validated.data as T, requestId, durationMs, tool: request.tool };
+    } catch (err: unknown) {
+      const durationMs = Date.now() - start;
+      const error = err instanceof Error ? err.message : String(err);
+      this.record(requestId, request.tool, false, durationMs);
+      return { success: false, error, requestId, durationMs, tool: request.tool };
     }
   }
 
-  getAvailableTools() {
-    try {
-      return this.registry.list().map(t => ({
-        name: t.name,
-        description: t.description,
-      }));
-    } catch (error: any) {
-      throw new Error(`Get available tools error: ${error?.message || 'Unknown error'}`);
+  // ─── Telemetry ────────────────────────────────────────────────────────────
+
+  private record(requestId: string, tool: string, success: boolean, durationMs: number): void {
+    this.telemetry.push({ requestId, tool, success, durationMs, ts: Date.now() });
+    if (this.telemetry.length > 1000) this.telemetry.splice(0, 100);
+  }
+
+  stats(): Record<string, { calls: number; errors: number; avgMs: number }> {
+    const acc: Record<string, { calls: number; errors: number; totalMs: number }> = {};
+    for (const entry of this.telemetry) {
+      if (!acc[entry.tool]) acc[entry.tool] = { calls: 0, errors: 0, totalMs: 0 };
+      acc[entry.tool].calls++;
+      acc[entry.tool].totalMs += entry.durationMs;
+      if (!entry.success) acc[entry.tool].errors++;
     }
+    return Object.fromEntries(
+      Object.entries(acc).map(([name, s]) => [
+        name,
+        { calls: s.calls, errors: s.errors, avgMs: Math.round(s.totalMs / s.calls) },
+      ])
+    );
+  }
+
+  // ─── Introspection ────────────────────────────────────────────────────────
+
+  tools(): Array<{ name: string; description: string; circuitOpen: boolean }> {
+    return this.registry.list().map((t) => ({
+      name: t.name,
+      description: t.description,
+      circuitOpen: this.getCircuit(t.name).open,
+    }));
+  }
+
+  health(): { status: 'healthy' | 'degraded'; tools: number; openCircuits: string[] } {
+    const openCircuits = this.registry
+      .names()
+      .filter((n) => this.getCircuit(n).open);
+    return {
+      status: openCircuits.length === 0 ? 'healthy' : 'degraded',
+      tools: this.registry.size(),
+      openCircuits,
+    };
   }
 }
+
+export const server = new MCPServer();
