@@ -1,5 +1,7 @@
 import { z } from 'zod';
-import { readFileSync } from 'fs';
+import { readFileSync, realpathSync } from 'fs';
+import { timingSafeEqual } from 'crypto';
+import { isAbsolute, relative, resolve } from 'path';
 import {
   supabaseQueryTool,
   supabaseInsertTool,
@@ -18,13 +20,15 @@ export interface MCPTool {
   description: string;
   inputSchema: z.ZodSchema;
   outputSchema: z.ZodSchema;
-  handler: (input: unknown) => Promise<unknown>;
+  // MCPServer validates inputSchema before invoking the handler.
+  handler: (input: z.infer<z.ZodTypeAny>) => Promise<unknown>;
 }
 
 export interface MCPRequest {
   tool: string;
   input: unknown;
   requestId?: string;
+  authorization?: string;
 }
 
 export interface MCPResponse<T = unknown> {
@@ -109,11 +113,31 @@ const readFileTool: MCPTool = {
     sizeBytes: z.number(),
     encoding: z.string(),
   }),
-  handler: async ({ path, encoding }) => {
-    const raw = readFileSync(path as string);
-    const content =
-      encoding === 'base64' ? raw.toString('base64') : raw.toString('utf-8');
-    return { content, sizeBytes: raw.byteLength, encoding: encoding as string };
+  handler: async (input) => {
+    const { path, encoding } = input as { path: string; encoding: 'utf-8' | 'base64' };
+    const configuredRoot = process.env.MCP_READ_ROOT;
+    if (!configuredRoot) {
+      throw new Error('MCP_READ_ROOT must be configured before the read_file tool can be used');
+    }
+
+    const root = realpathSync(configuredRoot);
+    if (isAbsolute(path)) {
+      throw new Error('read_file accepts paths relative to MCP_READ_ROOT only');
+    }
+    const candidate = resolve(root, path);
+    const candidateRelative = relative(root, candidate);
+    if (candidateRelative === '' || candidateRelative.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) || candidateRelative === '..') {
+      throw new Error('Requested file is outside MCP_READ_ROOT');
+    }
+
+    const target = realpathSync(candidate);
+    if (relative(root, target).startsWith('..')) {
+      throw new Error('Requested file resolves outside MCP_READ_ROOT');
+    }
+
+    const raw = readFileSync(target);
+    const content = encoding === 'base64' ? raw.toString('base64') : raw.toString('utf-8');
+    return { content, sizeBytes: raw.byteLength, encoding };
   },
 };
 
@@ -207,11 +231,28 @@ export class MCPServer {
 
   // ─── Request Handler ──────────────────────────────────────────────────────
 
+  private requireAuthentication(provided?: string): void {
+    const expected = process.env.MCP_API_TOKEN;
+    if (!expected) {
+      throw new Error('MCP_API_TOKEN must be configured before MCP tools can be used');
+    }
+    if (!provided) {
+      throw new Error('MCP authorization token is required');
+    }
+
+    const supplied = Buffer.from(provided);
+    const configured = Buffer.from(expected);
+    if (supplied.length !== configured.length || !timingSafeEqual(supplied, configured)) {
+      throw new Error('MCP authorization token is invalid');
+    }
+  }
+
   async handle<T = unknown>(request: MCPRequest): Promise<MCPResponse<T>> {
     const start = Date.now();
     const requestId = request.requestId ?? crypto.randomUUID();
 
     try {
+      this.requireAuthentication(request.authorization);
       this.checkCircuit(request.tool);
       const tool = this.registry.get(request.tool);
 
